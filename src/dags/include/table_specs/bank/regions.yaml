@@ -1,0 +1,6 @@
+table_id: bank.regions
+sync_mode: full
+incremental_key: null
+drop_columns: []
+schedule: "@daily"
+enabled: true

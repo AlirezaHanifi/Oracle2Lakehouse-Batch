@@ -1,0 +1,6 @@
+table_id: bank.job_history
+sync_mode: incremental
+incremental_key: end_date
+drop_columns: []
+schedule: "@daily"
+enabled: true

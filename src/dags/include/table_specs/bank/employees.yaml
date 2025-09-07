@@ -1,0 +1,10 @@
+table_id: bank.employees
+sync_mode: incremental
+incremental_key: last_update_ts
+drop_columns:
+    - email
+    - phone_number
+    - first_name
+    - last_name
+schedule: "@hourly"
+enabled: true

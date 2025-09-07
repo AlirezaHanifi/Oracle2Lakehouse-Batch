@@ -1,0 +1,6 @@
+table_id: bank.countries
+sync_mode: full
+incremental_key: null
+drop_columns: []
+schedule: "@daily"
+enabled: true
