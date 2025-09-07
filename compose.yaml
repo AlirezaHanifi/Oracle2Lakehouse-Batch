@@ -1,0 +1,73 @@
+name: ${COMPOSE_PROJECT_NAME}
+
+include:
+    - compose.airflow.yaml
+
+services:
+    oracle:
+        image: gvenzl/oracle-free:${ORACLE_IMAGE_TAG}
+        container_name: oracle
+        hostname: oracle
+        ports:
+            - "${ORACLE_HOST_PORT}:1521"
+        environment:
+            ORACLE_PASSWORD: ${ORACLE_SYS_PASSWORD}
+            APP_USER: ${ORACLE_APP_USER}
+            APP_USER_PASSWORD: ${ORACLE_APP_USER_PASSWORD}
+        healthcheck:
+            test: ["CMD", "healthcheck.sh"]
+            interval: 10s
+            timeout: 5s
+            retries: 10
+            start_period: 5s
+            start_interval: 5s
+        volumes:
+            - ${ORACLE_DATA_VOLUME}:/opt/oracle/oradata
+            - ./src/sql/init.sql:/container-entrypoint-initdb.d/init.sql:ro
+        networks:
+            - oracle2lakehouse-net
+
+    minio:
+        image: minio/minio:${MINIO_IMAGE_TAG}
+        container_name: minio
+        hostname: minio
+        ports:
+            - "${MINIO_HOST_PORT_API}:9000"
+            - "${MINIO_HOST_PORT_CONSOLE}:9001"
+        environment:
+            MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+            MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+        command: server --console-address ":9001" /data
+        volumes:
+            - ${MINIO_DATA_VOLUME}:/data
+        networks:
+            - oracle2lakehouse-net
+
+    # dremio:
+    #     image: dremio/dremio-oss:${DREMIO_IMAGE_TAG}
+    #     ports:
+    #         - "${DREMIO_HOST_PORT_UI}:9047"
+    #         - "${DREMIO_HOST_PORT_CLIENT}:31010"
+    #         - "${DREMIO_HOST_PORT_FLIGHT}:45678"
+    #     environment:
+    #         - DREMIO_JAVA_EXTRA_OPTS=-Ddremio.s3.compat=true
+    #     volumes:
+    #         - ${DREMIO_DATA_VOLUME}:/opt/dremio/data
+    #     depends_on:
+    #         - minio
+    #     networks:
+    #         - oracle2lakehouse-net
+
+    # nessie:
+    #     image: ghcr.io/projectnessie/nessie:${NESSIE_IMAGE_TAG}
+    #     ports:
+    #         - "${NESSIE_HOST_PORT}:19120"
+    #     environment:
+    #         - QUARKUS_PROFILE=prod
+    #     networks:
+    #         - oracle2lakehouse-net
+
+networks:
+    oracle2lakehouse-net:
+        driver: bridge
+        name: oracle2lakehouse-net
