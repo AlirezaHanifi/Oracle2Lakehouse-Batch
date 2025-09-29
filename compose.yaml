@@ -6,7 +6,7 @@ include:
 services:
     oracle:
         image: gvenzl/oracle-free:${ORACLE_IMAGE_TAG}
-        container_name: oracle
+        container_name: ${COMPOSE_PROJECT_NAME}-oracle
         hostname: oracle
         ports:
             - "${ORACLE_HOST_PORT}:1521"
@@ -29,7 +29,7 @@ services:
 
     minio:
         image: minio/minio:${MINIO_IMAGE_TAG}
-        container_name: minio
+        container_name: ${COMPOSE_PROJECT_NAME}-minio
         hostname: minio
         ports:
             - "${MINIO_HOST_PORT_API}:9000"
@@ -37,35 +37,82 @@ services:
         environment:
             MINIO_ROOT_USER: ${MINIO_ROOT_USER}
             MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-        command: server --console-address ":9001" /data
+            MINIO_REGION: us-east-1
+            MINIO_DOMAIN: minio
+            MINIO_BROWSER_REDIRECT_URL: http://localhost:9001
+            MINIO_SERVER_URL: http://localhost:9000
+            MINIO_CONSOLE_ADDRESS: ":9001"
+            MINIO_ADDRESS: ":9000"
+            MINIO_VOLUMES: "/data"
+            MINIO_HTTP_TRACE: "/dev/stdout"
+        command: server --console-address ":9001" --address ":9000" /data
+        healthcheck:
+            test: ["CMD", "mc", "ready", "local"]
+            interval: 10s
+            timeout: 5s
+            retries: 3
+            start_period: 10s
         volumes:
             - ${MINIO_DATA_VOLUME}:/data
         networks:
             - oracle2lakehouse-net
 
-    # dremio:
-    #     image: dremio/dremio-oss:${DREMIO_IMAGE_TAG}
-    #     ports:
-    #         - "${DREMIO_HOST_PORT_UI}:9047"
-    #         - "${DREMIO_HOST_PORT_CLIENT}:31010"
-    #         - "${DREMIO_HOST_PORT_FLIGHT}:45678"
-    #     environment:
-    #         - DREMIO_JAVA_EXTRA_OPTS=-Ddremio.s3.compat=true
-    #     volumes:
-    #         - ${DREMIO_DATA_VOLUME}:/opt/dremio/data
-    #     depends_on:
-    #         - minio
-    #     networks:
-    #         - oracle2lakehouse-net
+    iceberg-rest:
+        image: tabulario/iceberg-rest:1.6.0
+        container_name: ${COMPOSE_PROJECT_NAME}-iceberg-rest
+        hostname: iceberg-rest
+        ports:
+            - "${ICEBERG_REST_PORT}:8181"
+        environment:
+            # Core settings
+            - CATALOG__IMPL=org.apache.iceberg.rest.RESTCatalog
+            - CATALOG__IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+            - CATALOG__WAREHOUSE=s3://raw
+            - CATALOG__FILE__IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+            # AWS/S3 settings
+            - CATALOG__S3__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+            - CATALOG__S3__ENDPOINT=minio:9000
+            - CATALOG__S3__ACCESS__KEY__ID=minioadmin
+            - CATALOG__S3__SECRET__ACCESS__KEY=minioadmin
+            - CATALOG__S3__PATH__STYLE__ACCESS=true
+            - CATALOG__S3__SSE__ENABLED=false
+            # AWS SDK settings
+            - AWS_ACCESS_KEY_ID=minioadmin
+            - AWS_SECRET_ACCESS_KEY=minioadmin
+            - AWS_REGION=us-east-1
+            - AWS_DEFAULT_REGION=us-east-1
+            - AWS_EC2_METADATA_DISABLED=true
+            # Additional S3 properties
+            - CATALOG__S3__PROPERTIES__AWS__ACCESS__KEY__ID=minioadmin
+            - CATALOG__S3__PROPERTIES__AWS__SECRET__ACCESS__KEY=minioadmin
+            - CATALOG__S3__PROPERTIES__AWS__REGION=us-east-1
+            - CATALOG__S3__PROPERTIES__FS__S3A__ACCESS__KEY=minioadmin
+            - CATALOG__S3__PROPERTIES__FS__S3A__SECRET__KEY=minioadmin
+            - CATALOG__S3__PROPERTIES__FS__S3A__ENDPOINT=minio:9000
+            - CATALOG__S3__PROPERTIES__FS__S3A__PATH__STYLE__ACCESS=true
+            # Debug logging
+            - JAVA_TOOL_OPTIONS=-Dorg.slf4j.simpleLogger.defaultLogLevel=debug -Daws.sdk.disableEc2Metadata=true
+            # Timestamp handling
+            - CATALOG__TIMESTAMP__PRECISION=microseconds
+            - CATALOG__DOWNCAST__NS__TIMESTAMP__TO__US__ON__WRITE=true
+            # Additional catalog settings
+            - CATALOG__STORE=org.apache.iceberg.aws.s3.S3FileIO
+            - CATALOG__CATALOG__IMPL=org.apache.iceberg.rest.RESTCatalog
+            - CATALOG__COMMIT_TABLE_CACHE_ENABLED=true
+            # Configure commit lock provider to use S3
+            - CATALOG__LOCK__IMPL=org.apache.iceberg.aws.s3.S3LockManager
+            - CATALOG__COMMIT_TABLE_CACHE_EXPIRATION_INTERVAL_MS=300000
+        healthcheck:
+            test: ["CMD", "wget", "--spider", "-q", "http://localhost:8181/v1/config"]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+            start_period: 10s
+        depends_on:
+            - minio
+        networks:
+            - oracle2lakehouse-net
 
-    # nessie:
-    #     image: ghcr.io/projectnessie/nessie:${NESSIE_IMAGE_TAG}
-    #     ports:
-    #         - "${NESSIE_HOST_PORT}:19120"
-    #     environment:
-    #         - QUARKUS_PROFILE=prod
-    #     networks:
-    #         - oracle2lakehouse-net
 
 networks:
     oracle2lakehouse-net:
