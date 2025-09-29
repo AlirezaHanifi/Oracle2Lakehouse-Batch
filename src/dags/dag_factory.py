@@ -11,33 +11,28 @@ files. It supports two synchronization modes: 'incremental' and 'full'.
 
 import glob
 import logging
-from typing import Any, Dict, List, Tuple
 
 import pendulum
 import yaml
-from airflow.decorators import branch_task, dag, task
+from airflow.decorators import dag, task
 from airflow.operators.empty import EmptyOperator
-from dags.include.utils.minio import MinioClient
-from dags.include.utils.oracle import OracleClient
 
-TABLE_SPEC_DIR: str = "/opt/airflow/dags/include/table_specs"
+TABLE_SPEC_DIR = "/opt/airflow/dags/include/table_specs"
 
 
-def _get_clients() -> Tuple[OracleClient, MinioClient]:
-    oracle_client = OracleClient()
-    minio_client = MinioClient()
-    minio_client.ensure_bucket("raw")
-    minio_client.ensure_bucket("audit")
-    return oracle_client, minio_client
+def _execute_full_sync(table_spec, ts_nodash, **context):
+    from dags.include.utils.audit import AuditClient
+    from dags.include.utils.iceberg import IcebergClient
+    from dags.include.utils.oracle import OracleClient
 
-
-def _execute_full_sync(table_spec: Dict[str, Any], ts_nodash: str) -> None:
     table_id = table_spec["table_id"]
-    schema, table = table_id.split(".")
     logging.info("📥 Starting FULL sync for %s", table_id)
-    oracle, minio = _get_clients()
 
-    df = oracle.fetch_table(
+    oracle_client = OracleClient()
+    iceberg_client = IcebergClient()
+    audit_client = AuditClient(minio_endpoint="http://minio:9000", bucket="audit")
+
+    df = oracle_client.fetch_table(
         table=table_id,
         sync_mode="full",
         drop_cols=table_spec.get("drop_columns", []),
@@ -45,38 +40,52 @@ def _execute_full_sync(table_spec: Dict[str, Any], ts_nodash: str) -> None:
 
     if df.empty:
         logging.warning(
-            "⏹️ No data found for full sync of %s. Skipping upload.", table_id
+            "⏹️ No data found for full sync of %s. Skipping write.", table_id
+        )
+        audit_client.write(
+            table_id=table_id,
+            row_count=0,
+            sync_mode="full",
+            status="skipped",
+            details="No data found",
+            data_interval_end=context["data_interval_end"].isoformat()
+            if context.get("data_interval_end")
+            else None,
         )
         return
 
-    object_name = f"{schema}/{table}.parquet"
-    audit_object = f"{schema}/{table}/full_load_audit_{ts_nodash}.json"
+    table_path = iceberg_client.write(
+        table_id=table_id,
+        df=df,
+        drop_cols=table_spec.get("drop_columns", []),
+    )
 
-    minio.upload_parquet(bucket="raw", object_name=object_name, df=df)
+    audit_client.write(
+        table_id=table_id,
+        row_count=len(df),
+        sync_mode="full",
+        status="success",
+        data_interval_end=context["data_interval_end"].isoformat()
+        if context.get("data_interval_end")
+        else None,
+        details=f"Written to {table_path}",
+    )
+    logging.info("✅ FULL sync finished for %s", table_id)
 
-    audit_record = {
-        "table_id": table_id,
-        "sync_mode": "full",
-        "rows": len(df),
-        "object": object_name,
-        "status": "success",
-        "synced_at": pendulum.now("Asia/Tehran").isoformat(),
-    }
-    minio.upload_json(bucket="audit", object_name=audit_object, data=audit_record)
-    logging.info("✅ FULL sync finished for %s. Object: %s", table_id, object_name)
 
+def _execute_incremental_sync(table_spec, data_interval_start, data_interval_end):
+    from dags.include.utils.audit import AuditClient
+    from dags.include.utils.iceberg import IcebergClient
+    from dags.include.utils.oracle import OracleClient
 
-def _execute_incremental_sync(
-    table_spec: Dict[str, Any],
-    data_interval_start: pendulum.DateTime,
-    data_interval_end: pendulum.DateTime,
-) -> None:
     table_id = table_spec["table_id"]
-    schema, table = table_id.split(".")
     logging.info("📥 Starting INCREMENTAL sync for %s", table_id)
-    oracle, minio = _get_clients()
 
-    df = oracle.fetch_table(
+    oracle_client = OracleClient()
+    iceberg_client = IcebergClient()
+    audit_client = AuditClient(minio_endpoint="http://minio:9000", bucket="audit")
+
+    df = oracle_client.fetch_table(
         table=table_id,
         sync_mode="incremental",
         incremental_key=table_spec.get("incremental_key"),
@@ -87,32 +96,38 @@ def _execute_incremental_sync(
 
     if df.empty:
         logging.warning(
-            "⏹️ No new data for incremental sync of %s. Skipping upload.", table_id
+            "⏹️ No new data for incremental sync of %s. Skipping write.", table_id
+        )
+        audit_client.write(
+            table_id=table_id,
+            row_count=0,
+            sync_mode="incremental",
+            status="skipped",
+            details="No new data found",
+            data_interval_start=data_interval_start.isoformat(),
+            data_interval_end=data_interval_end.isoformat(),
         )
         return
 
-    object_name = f"{schema}/{table}/{data_interval_end.isoformat()}.parquet"
-    audit_object = f"{schema}/{table}/{data_interval_end.isoformat()}.json"
-
-    minio.upload_parquet(bucket="raw", object_name=object_name, df=df)
-
-    audit_record = {
-        "table_id": table_id,
-        "sync_mode": "incremental",
-        "rows": len(df),
-        "interval_start": str(data_interval_start),
-        "interval_end": str(data_interval_end),
-        "object": object_name,
-        "status": "success",
-        "synced_at": pendulum.now("Asia/Tehran").isoformat(),
-    }
-    minio.upload_json(bucket="audit", object_name=audit_object, data=audit_record)
-    logging.info(
-        "✅ INCREMENTAL sync finished for %s. Object: %s", table_id, object_name
+    table_path = iceberg_client.write(
+        table_id=table_id,
+        df=df,
+        drop_cols=table_spec.get("drop_columns", []),
     )
 
+    audit_client.write(
+        table_id=table_id,
+        row_count=len(df),
+        sync_mode="incremental",
+        status="success",
+        data_interval_start=data_interval_start.isoformat(),
+        data_interval_end=data_interval_end.isoformat(),
+        details=f"Written to {table_path}",
+    )
+    logging.info("✅ INCREMENTAL sync finished for %s", table_id)
 
-def load_table_specs() -> List[Dict[str, Any]]:
+
+def load_table_specs():
     specs = []
     yaml_files = glob.glob(f"{TABLE_SPEC_DIR}/**/*.yaml", recursive=True)
     for file_path in yaml_files:
@@ -123,8 +138,37 @@ def load_table_specs() -> List[Dict[str, Any]]:
     return specs
 
 
-def create_sync_dag(table_spec: Dict[str, Any]):
+@task(task_id="ensure_buckets")
+def ensure_buckets():
+    from dags.include.utils.minio import MinioClient
+
+    minio_client = MinioClient()
+    minio_client.ensure_bucket("raw")
+
+
+@task.branch
+def choose_sync_mode(table_spec):
     table_id = table_spec["table_id"]
+    mode = table_spec["sync_mode"]
+    logging.info("🔀 Sync mode for %s is '%s'.", table_id, mode)
+    if mode == "incremental":
+        return "incremental_sync"
+    return "full_sync"
+
+
+@task(task_id="incremental_sync")
+def incremental_sync_task(table_spec, data_interval_start, data_interval_end):
+    _execute_incremental_sync(table_spec, data_interval_start, data_interval_end)
+
+
+@task(task_id="full_sync")
+def full_sync_task(table_spec, ts_nodash, **context):
+    _execute_full_sync(table_spec, ts_nodash, **context)
+
+
+def create_sync_dag(table_spec):
+    table_id = table_spec["table_id"]
+    schema, table = table_id.split(".")
     dag_id = f"sync_{table_id.replace('.', '_')}"
 
     @dag(
@@ -132,39 +176,32 @@ def create_sync_dag(table_spec: Dict[str, Any]):
         schedule=table_spec.get("schedule", "@daily"),
         start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
         catchup=False,
-        default_args={"owner": "Alireza", "retries": 1},
-        tags=["batch", "lakehouse", "oracle-to-minio"],
-        doc_md=f"### Sync DAG for `{table_id}`\n**Sync Mode:** `{table_spec['sync_mode']}`",
+        default_args={"owner": "Alireza"},
+        tags=["batch", "lakehouse", "oracle-to-iceberg"],
+        doc_md=(
+            f"### Sync DAG for `{table_id}`\n"
+            f"**Sync Mode:** `{table_spec['sync_mode']}`\n"
+            "**Storage:** Apache Iceberg"
+        ),
     )
     def dynamic_sync_dag():
-        @branch_task
-        def choose_sync_mode() -> str:
-            mode = table_spec["sync_mode"]
-            logging.info("🔀 Sync mode for %s is '%s'.", table_id, mode)
-            if mode == "incremental":
-                return "incremental_sync"
-            return "full_sync"
-
-        @task(task_id="incremental_sync")
-        def incremental_sync_task(
-            data_interval_start: pendulum.DateTime, data_interval_end: pendulum.DateTime
-        ):
-            _execute_incremental_sync(
-                table_spec, data_interval_start, data_interval_end
-            )
-
-        @task(task_id="full_sync")
-        def full_sync_task(ts_nodash: str):
-            _execute_full_sync(table_spec, ts_nodash)
-
         start = EmptyOperator(task_id="start")
         end = EmptyOperator(task_id="end", trigger_rule="one_success")
+
+        create_buckets = ensure_buckets()
+
+        branch_task = choose_sync_mode(table_spec=table_spec)
+        incremental_task_instance = incremental_sync_task(table_spec=table_spec)
+        full_task_instance = full_sync_task(table_spec=table_spec)
+
         (
             start
-            >> choose_sync_mode()  # type: ignore[call-arg]
-            >> [incremental_sync_task(), full_sync_task()]
-            >> end
+            >> create_buckets
+            >> branch_task
+            >> [incremental_task_instance, full_task_instance]
         )
+
+        [incremental_task_instance, full_task_instance] >> end
 
     return dynamic_sync_dag()
 
