@@ -50,11 +50,11 @@ class ClickHouseClient:
         We don't try to coerce results here; callers should use helpers below
         when they expect specific shapes (scalars, rows, etc.).
         """
-        logging.debug("Executing ClickHouse query: %s", query.replace("\n", " "))
+        logging.debug("🔎 Executing ClickHouse query: %s", query.replace("\n", " "))
         try:
             return self.client.command(query, parameters=parameters, settings=settings)
         except Exception as exc:
-            logging.exception("ClickHouse query failed: %s", exc)
+            logging.exception("❌ ClickHouse query failed: %s", exc)
             raise
 
     def _unwrap_scalar(self, result: Any) -> Optional[Any]:
@@ -94,7 +94,7 @@ class ClickHouseClient:
         return None
 
     def _ensure_database(self, database: str) -> None:
-        logging.debug("Ensuring database exists: %s", database)
+        logging.debug("📁 Ensuring database exists: %s", database)
         self.execute(f"CREATE DATABASE IF NOT EXISTS {database}")
 
     def _table_exists(self, database: str, table: str) -> bool:
@@ -106,18 +106,44 @@ class ClickHouseClient:
         cnt = self._unwrap_scalar(raw)
         exists = bool(cnt)
         logging.debug(
-            "Table exists check %s.%s -> %s (count=%s)", database, table, exists, cnt
+            "🔎 Table exists check %s.%s -> %s (count=%s)", database, table, exists, cnt
         )
         return exists
 
     def _get_table_count(self, database: str, table: str) -> int:
+        try:
+            if not self._table_exists(database, table):
+                logging.debug(
+                    "⚠️ Table %s.%s does not exist when counting -> 0", database, table
+                )
+                return 0
+        except Exception:
+            logging.debug(
+                "⚠️ Table existence check failed for %s.%s; attempting count",
+                database,
+                table,
+            )
+
         query = f"SELECT count() FROM {database}.{table}"
-        raw = self.execute(query)
+        try:
+            raw = self.execute(query)
+        except Exception as exc:
+            msg = str(exc)
+            if "UNKNOWN_TABLE" in msg or "Unknown table" in msg or "Code: 60" in msg:
+                logging.debug(
+                    "❌ Count failed because table missing %s.%s: %s",
+                    database,
+                    table,
+                    msg,
+                )
+                return 0
+            raise
+
         val = self._unwrap_scalar(raw)
         try:
             return int(val) if val is not None else 0
         except (ValueError, TypeError):
-            logging.warning("Could not coerce table count to int: %r", val)
+            logging.warning("⚠️ Could not coerce table count to int: %r", val)
             return 0
 
     def create_table_if_not_exists(
@@ -159,7 +185,7 @@ class ClickHouseClient:
             settings_sql = ",\n".join(f"{k}={v}" for k, v in settings.items())
             query += f"\nSETTINGS\n{settings_sql}"
 
-        logging.info("Creating/ensuring table %s.%s", database, table)
+        logging.info("📦 Creating/ensuring table %s.%s", database, table)
         self.execute(query)
 
     def load_parquet_from_s3(
@@ -192,7 +218,7 @@ class ClickHouseClient:
         secret = s3_credentials.get("secret_access_key", "")
 
         logging.info(
-            "Starting ClickHouse load from S3: %s -> %s.%s", url, database, table
+            "📥 Starting ClickHouse load from S3: %s -> %s.%s", url, database, table
         )
 
         self._ensure_database(database)
@@ -215,7 +241,7 @@ class ClickHouseClient:
                 'Parquet'
             )"""
             logging.info(
-                "Table %s.%s does not exist. Creating from Parquet schema.",
+                "📦 Table %s.%s does not exist. Creating from Parquet schema.",
                 database,
                 table,
             )
@@ -230,21 +256,22 @@ class ClickHouseClient:
                 'Parquet'
             )"""
             logging.info(
-                "Table %s.%s exists. Inserting data from Parquet.", database, table
+                "📥 Table %s.%s exists. Inserting data from Parquet.", database, table
             )
 
         self.execute(query)
 
         if expected_rows is not None:
             logging.info(
-                "Assuming %d rows were inserted (provided by upstream).", expected_rows
+                "✅ Assuming %d rows were inserted (provided by upstream).",
+                expected_rows,
             )
             return expected_rows
 
         after_count = self._get_table_count(database, table)
         inserted = max(0, after_count - (before_count or 0))
         logging.info(
-            "Load complete. Table rows before=%s after=%s inserted=%s",
+            "✅ Load complete. Table rows before=%s after=%s inserted=%s",
             before_count,
             after_count,
             inserted,
