@@ -1,53 +1,52 @@
-from typing import Optional
+"""
+Audit module for Oracle2Lakehouse-Batch.
 
-import pandas as pd
+1. This module records synchronization audit logs in ClickHouse.
+2. It ensures that the audit table exists and logs each synchronization
+operation with the number of inserted rows, status, and timestamp
+"""
 
-from dags.include.utils.iceberg import IcebergClient
+from typing import TYPE_CHECKING, Any, Dict
+
+if TYPE_CHECKING:
+    from .clickhouse import ClickHouseClient
 
 
-class AuditClient:
-    def __init__(
-        self, minio_endpoint: str = "http://minio:9000", bucket: str = "audit"
-    ):
-        self.minio_endpoint = minio_endpoint
-        self.bucket = bucket
-        self.iceberg_client = IcebergClient()
+def log_sync_audit(
+    spec: Dict[str, Any], rows_inserted: int, ch_client: ClickHouseClient
+) -> None:
+    import logging
 
-    def _table_path(self, table_id: str) -> str:
-        """Generate the table path for audit logs"""
-        schema, table = table_id.split(".")
-        return f"audit.{schema}_{table}_audit"
+    audit_db = spec["clickhouse"].get("audit_database", spec["clickhouse"]["database"])
+    audit_table = spec["clickhouse"].get(
+        "audit_table", f"{spec['clickhouse']['table']}_audit"
+    )
 
-    def write(
-        self,
-        table_id: str,
-        row_count: int,
-        sync_mode: str,
-        status: str,
-        data_interval_start: Optional[str] = None,
-        data_interval_end: Optional[str] = None,
-        details: str = "",
-    ) -> str:
-        audit_table_id = self._table_path(table_id)
-        df = pd.DataFrame(
-            [
-                {
-                    "table_id": str(table_id),
-                    "row_count": int(row_count),
-                    "sync_mode": str(sync_mode),
-                    "status": str(status),
-                    "details": str(details),
-                    "data_interval_start": str(data_interval_start)
-                    if data_interval_start
-                    else None,
-                    "data_interval_end": str(data_interval_end)
-                    if data_interval_end
-                    else None,
-                    "synced_at": str(pd.Timestamp.now()),
-                }
-            ]
+    ch_client.create_table_if_not_exists(
+        database=audit_db,
+        table=audit_table,
+        columns=[
+            ("table_id", "String"),
+            ("row_count", "Int64"),
+            ("status", "String"),
+            ("synced_at", "DateTime64(6)"),
+        ],
+        engine=spec["clickhouse"].get("audit_engine", "MergeTree()"),
+        order_by="synced_at",
+    )
+
+    query = f"""
+        INSERT INTO {audit_db}.{audit_table}
+        (table_id, row_count, status, synced_at)
+        VALUES
+        ('{spec["table_id"]}', {rows_inserted}, 'success', toTimeZone(now64(), 'Asia/Tehran'))
+    """
+
+    try:
+        ch_client.execute(query)
+        logging.info(
+            "✅ Logged audit record for %s (%d rows)", spec["table_id"], rows_inserted
         )
-
-        self.iceberg_client.write(table_id=audit_table_id, df=df)
-
-        return audit_table_id
+    except Exception as e:
+        logging.error("❌ Failed to log audit record: %s", e)
+        raise
