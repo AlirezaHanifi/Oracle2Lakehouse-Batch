@@ -6,6 +6,8 @@ Audit module for Oracle2Lakehouse-Batch.
 operation with the number of inserted rows, status, and timestamp
 """
 
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, Any, Dict
 
 if TYPE_CHECKING:
