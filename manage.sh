@@ -57,24 +57,14 @@ start_and_configure() {
             "service_name": "'"$ORACLE_SERVICE_NAME"'"
         }' >/dev/null 2>&1 &
 
-    docker compose exec -T "$AIRFLOW_SERVICE_NAME" airflow connections add 'iceberg_default' \
-        --conn-type 'iceberg' \
-        --conn-host 'iceberg-rest' \
-        --conn-port '8181' \
-        --conn-login "$MINIO_ROOT_USER" \
-        --conn-password "$MINIO_ROOT_PASSWORD" \
+    docker compose exec -T "$AIRFLOW_SERVICE_NAME" airflow connections add 'clickhouse_default' \
+        --conn-type 'clickhouse' \
+        --conn-host 'clickhouse' \
+        --conn-port '8123' \
+        --conn-login "${CLICKHOUSE_USER:-default}" \
+        --conn-password "${CLICKHOUSE_PASSWORD:-clickhouse}" \
         --conn-extra '{
-            "catalog_type": "rest",
-            "warehouse_path": "s3://raw",
-            "s3_endpoint_url": "http://minio:9000",
-            "catalog_impl": "org.apache.iceberg.rest.RESTCatalog",
-            "io_impl": "org.apache.iceberg.aws.s3.S3FileIO",
-            "s3.access-key-id": "'"$MINIO_ROOT_USER"'",
-            "s3.secret-access-key": "'"$MINIO_ROOT_PASSWORD"'",
-            "s3.endpoint": "http://minio:9000",
-            "s3.region": "us-east-1",
-            "s3.path-style-access": "true",
-            "s3.ssl-enabled": "false"
+            "database": "'"${CLICKHOUSE_DB:-bank}"'"
         }' >/dev/null 2>&1 &
 
     wait
