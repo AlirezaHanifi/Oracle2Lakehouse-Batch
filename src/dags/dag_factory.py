@@ -1,211 +1,205 @@
 """
-Airflow DAG Generator for Oracle to MinIO Synchronization.
+DAG Factory for Oracle2Lakehouse-Batch.
 
-This script dynamically generates an Airflow DAG for each table specified in YAML configuration
-files. It supports two synchronization modes: 'incremental' and 'full'.
-
-- A branch operator determines the sync mode at runtime.
-- Incremental loads append data using timestamped Parquet files.
-- Full loads overwrite a single, static Parquet file for each table.
+This module dynamically generates Apache Airflow DAGs for synchronizing data
+from Oracle to ClickHouse using MinIO/S3 as intermediate storage.
 """
 
-import glob
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
-import pendulum
-import yaml
-from airflow.decorators import dag, task
-from airflow.operators.empty import EmptyOperator
+from airflow.sdk import dag, task
+from dags.include.utils import data_handlers
+from dags.include.utils.clickhouse import ClickHouseClient
+from dags.include.utils.oracle import OracleClient
 
-TABLE_SPEC_DIR = "/opt/airflow/dags/include/table_specs"
-
-
-def _execute_full_sync(table_spec, ts_nodash, **context):
-    from dags.include.utils.audit import AuditClient
-    from dags.include.utils.iceberg import IcebergClient
-    from dags.include.utils.oracle import OracleClient
-
-    table_id = table_spec["table_id"]
-    logging.info("📥 Starting FULL sync for %s", table_id)
-
-    oracle_client = OracleClient()
-    iceberg_client = IcebergClient()
-    audit_client = AuditClient(minio_endpoint="http://minio:9000", bucket="audit")
-
-    df = oracle_client.fetch_table(
-        table=table_id,
-        sync_mode="full",
-        drop_cols=table_spec.get("drop_columns", []),
-    )
-
-    if df.empty:
-        logging.warning(
-            "⏹️ No data found for full sync of %s. Skipping write.", table_id
-        )
-        audit_client.write(
-            table_id=table_id,
-            row_count=0,
-            sync_mode="full",
-            status="skipped",
-            details="No data found",
-            data_interval_end=context["data_interval_end"].isoformat()
-            if context.get("data_interval_end")
-            else None,
-        )
-        return
-
-    table_path = iceberg_client.write(
-        table_id=table_id,
-        df=df,
-        drop_cols=table_spec.get("drop_columns", []),
-    )
-
-    audit_client.write(
-        table_id=table_id,
-        row_count=len(df),
-        sync_mode="full",
-        status="success",
-        data_interval_end=context["data_interval_end"].isoformat()
-        if context.get("data_interval_end")
-        else None,
-        details=f"Written to {table_path}",
-    )
-    logging.info("✅ FULL sync finished for %s", table_id)
+if TYPE_CHECKING:
+    from pendulum import DateTime
 
 
-def _execute_incremental_sync(table_spec, data_interval_start, data_interval_end):
-    from dags.include.utils.audit import AuditClient
-    from dags.include.utils.iceberg import IcebergClient
-    from dags.include.utils.oracle import OracleClient
+def load_table_specs() -> List[Dict[str, Any]]:
+    import glob
+    import os
 
-    table_id = table_spec["table_id"]
-    logging.info("📥 Starting INCREMENTAL sync for %s", table_id)
+    import yaml
 
-    oracle_client = OracleClient()
-    iceberg_client = IcebergClient()
-    audit_client = AuditClient(minio_endpoint="http://minio:9000", bucket="audit")
-
-    df = oracle_client.fetch_table(
-        table=table_id,
-        sync_mode="incremental",
-        incremental_key=table_spec.get("incremental_key"),
-        start_ts=data_interval_start.to_datetime_string(),
-        end_ts=data_interval_end.to_datetime_string(),
-        drop_cols=table_spec.get("drop_columns", []),
-    )
-
-    if df.empty:
-        logging.warning(
-            "⏹️ No new data for incremental sync of %s. Skipping write.", table_id
-        )
-        audit_client.write(
-            table_id=table_id,
-            row_count=0,
-            sync_mode="incremental",
-            status="skipped",
-            details="No new data found",
-            data_interval_start=data_interval_start.isoformat(),
-            data_interval_end=data_interval_end.isoformat(),
-        )
-        return
-
-    table_path = iceberg_client.write(
-        table_id=table_id,
-        df=df,
-        drop_cols=table_spec.get("drop_columns", []),
-    )
-
-    audit_client.write(
-        table_id=table_id,
-        row_count=len(df),
-        sync_mode="incremental",
-        status="success",
-        data_interval_start=data_interval_start.isoformat(),
-        data_interval_end=data_interval_end.isoformat(),
-        details=f"Written to {table_path}",
-    )
-    logging.info("✅ INCREMENTAL sync finished for %s", table_id)
-
-
-def load_table_specs():
-    specs = []
-    yaml_files = glob.glob(f"{TABLE_SPEC_DIR}/**/*.yaml", recursive=True)
-    for file_path in yaml_files:
-        with open(file_path, "r") as f:
-            table_spec = yaml.safe_load(f)
-            if table_spec.get("enabled", True):
-                specs.append(table_spec)
+    base = os.environ.get("TABLE_SPEC_DIR", "/opt/airflow/dags/include/table_specs")
+    files = glob.glob(f"{base}/**/*.yaml", recursive=True)
+    specs: List[Dict[str, Any]] = []
+    for p in files:
+        with open(p, "r") as f:
+            s = yaml.safe_load(f) or {}
+            if s.get("enabled", True):
+                specs.append(s)
     return specs
 
 
-@task(task_id="ensure_buckets")
-def ensure_buckets():
-    from dags.include.utils.minio import MinioClient
+def _extract_from_oracle(
+    spec: Dict[str, Any],
+    data_interval_start: DateTime,
+    data_interval_end: DateTime,
+) -> Dict[str, Any]:
+    oracle = OracleClient(conn_id=spec.get("oracle_conn", "oracle_default"))
+    query = spec.get("query")
 
-    minio_client = MinioClient()
-    minio_client.ensure_bucket("raw")
+    if query:
+        params = spec.get("params", {})
+    else:
+        time_col = spec.get("time_column")
+        if time_col:
+            start, end = data_interval_start, data_interval_end
+            query = f"SELECT * FROM {spec['table_id']} WHERE {time_col} >= :start AND {time_col} < :end"
+            params = {"start": start, "end": end}
+        else:
+            query = f"SELECT * FROM {spec['table_id']}"
+            params = {}
+
+    logging.info("🔄 Extracting data from Oracle table %s", spec["table_id"])
+    pl_df = oracle.fetch_table(spec["table_id"], query=query, params=params)
+
+    if pl_df is None or pl_df.is_empty():
+        logging.info("⚠️ No data extracted from %s", spec["table_id"])
+        return {"mode": "empty", "path": None, "data": None}
+
+    s3_path = data_handlers.upload_df_to_minio(
+        spec=spec,
+        df=pl_df,
+        data_interval_start=data_interval_start,
+        data_interval_end=data_interval_end,
+    )
+    logging.info("✅ Successfully extracted and uploaded data for %s", spec["table_id"])
+    return {"mode": "s3", "path": s3_path, "data": None}
 
 
-@task.branch
-def choose_sync_mode(table_spec):
-    table_id = table_spec["table_id"]
-    mode = table_spec["sync_mode"]
-    logging.info("🔀 Sync mode for %s is '%s'.", table_id, mode)
-    if mode == "incremental":
-        return "incremental_sync"
-    return "full_sync"
+def _load_to_clickhouse(
+    spec: Dict[str, Any],
+    transformed_data: Dict[str, Any],
+    data_interval_start: Optional[DateTime] = None,
+    data_interval_end: Optional[DateTime] = None,
+) -> Dict[str, Any]:
+    """Load data from S3 to ClickHouse."""
+    s3_path = data_handlers.get_s3_path_from_payload(
+        spec=spec,
+        payload=transformed_data,
+        data_interval_start=data_interval_start,
+        data_interval_end=data_interval_end,
+    )
+    if s3_path is None:
+        logging.info("⚠️ No data to load for %s", spec["table_id"])
+        return {"rows_loaded": 0}
+
+    rows = transformed_data.get("rows", 0)
+    if not rows:
+        logging.info("⚠️ No rows to load for %s", spec["table_id"])
+        return {"rows_loaded": 0}
+
+    minio = data_handlers.get_minio_client(spec)
+    ch = ClickHouseClient(conn_id=spec.get("clickhouse_conn", "clickhouse_default"))
+    creds = minio.get_credentials()
+
+    logging.info("🔄 Starting load to ClickHouse for %s", spec["table_id"])
+
+    ch.load_parquet_from_s3(
+        database=spec["clickhouse"]["database"],
+        table=spec["clickhouse"]["table"],
+        s3_path=s3_path,
+        s3_credentials=creds,
+    )
+
+    logging.info("✅ Loaded %d rows to ClickHouse for %s", rows, spec["table_id"])
+    return {"rows_loaded": rows}
 
 
-@task(task_id="incremental_sync")
-def incremental_sync_task(table_spec, data_interval_start, data_interval_end):
-    _execute_incremental_sync(table_spec, data_interval_start, data_interval_end)
+def create_dag(table_spec: Dict[str, Any]):
+    import pendulum
+    from pendulum import DateTime
 
-
-@task(task_id="full_sync")
-def full_sync_task(table_spec, ts_nodash, **context):
-    _execute_full_sync(table_spec, ts_nodash, **context)
-
-
-def create_sync_dag(table_spec):
-    table_id = table_spec["table_id"]
-    schema, table = table_id.split(".")
-    dag_id = f"sync_{table_id.replace('.', '_')}"
+    dag_id = f"sync_{table_spec['table_id'].replace('.', '_')}"
 
     @dag(
         dag_id=dag_id,
         schedule=table_spec.get("schedule", "@daily"),
-        start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
-        catchup=False,
-        default_args={"owner": "Alireza"},
-        tags=["batch", "lakehouse", "oracle-to-iceberg"],
-        doc_md=(
-            f"### Sync DAG for `{table_id}`\n"
-            f"**Sync Mode:** `{table_spec['sync_mode']}`\n"
-            "**Storage:** Apache Iceberg"
+        start_date=cast(
+            DateTime,
+            pendulum.parse(
+                table_spec.get("start_date", "2025-09-01").strip(),
+                strict=False,
+            ),
+        ).in_timezone("Asia/Tehran"),
+        catchup=table_spec.get("catchup", False),
+        doc_md=table_spec.get(
+            "description", "Dynamically generated data synchronization DAG."
         ),
+        tags=table_spec.get("tags", ["batch", "oracle-to-clickhouse"]),
+        default_args={"owner": table_spec.get("owner", "airflow")},
     )
     def dynamic_sync_dag():
+        from airflow.providers.standard.operators.empty import EmptyOperator
+
+        @task
+        def ensure_bucket(spec: Dict[str, Any]) -> None:
+            return data_handlers.ensure_buckets(spec)
+
+        @task
+        def extract_data(spec: Dict[str, Any], **context) -> Dict[str, Any]:
+            return _extract_from_oracle(
+                spec, context["data_interval_start"], context["data_interval_end"]
+            )
+
+        @task
+        def transform_data(
+            spec: Dict[str, Any], extracted_data: Dict[str, Any], **context
+        ) -> Dict[str, Any]:
+            return data_handlers.transform_data(
+                spec=spec,
+                extracted_data=extracted_data,
+                data_interval_start=context["data_interval_start"],
+                data_interval_end=context["data_interval_end"],
+            )
+
+        @task
+        def load_data(
+            spec: Dict[str, Any], transformed_data: Dict[str, Any], **context
+        ) -> Dict[str, Any]:
+            return _load_to_clickhouse(
+                spec=spec,
+                transformed_data=transformed_data,
+                data_interval_start=context["data_interval_start"],
+                data_interval_end=context["data_interval_end"],
+            )
+
+        @task
+        def log_audit(spec: Dict[str, Any], load_result: Dict[str, Any]) -> None:
+            from dags.include.utils.audit import log_sync_audit
+
+            ch = ClickHouseClient(
+                conn_id=spec.get("clickhouse_conn", "clickhouse_default")
+            )
+            log_sync_audit(spec, load_result["rows_loaded"], ch)
+
         start = EmptyOperator(task_id="start")
+        bucket_ready = ensure_bucket(spec=table_spec)
+        extracted = extract_data(spec=table_spec)
+        transformed = transform_data(spec=table_spec, extracted_data=extracted)
+        load_complete = load_data(spec=table_spec, transformed_data=transformed)
+        audit_complete = log_audit(spec=table_spec, load_result=load_complete)
         end = EmptyOperator(task_id="end", trigger_rule="one_success")
-
-        create_buckets = ensure_buckets()
-
-        branch_task = choose_sync_mode(table_spec=table_spec)
-        incremental_task_instance = incremental_sync_task(table_spec=table_spec)
-        full_task_instance = full_sync_task(table_spec=table_spec)
 
         (
             start
-            >> create_buckets
-            >> branch_task
-            >> [incremental_task_instance, full_task_instance]
+            >> bucket_ready
+            >> extracted
+            >> transformed
+            >> load_complete
+            >> audit_complete
+            >> end
         )
-
-        [incremental_task_instance, full_task_instance] >> end
 
     return dynamic_sync_dag()
 
 
 for spec in load_table_specs():
     dag_id = f"sync_{spec['table_id'].replace('.', '_')}"
-    globals()[dag_id] = create_sync_dag(spec)
+    globals()[dag_id] = create_dag(spec)
