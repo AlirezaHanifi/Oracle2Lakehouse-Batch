@@ -25,7 +25,7 @@ services:
             - ${ORACLE_DATA_VOLUME}:/opt/oracle/oradata
             - ./src/sql/init.sql:/container-entrypoint-initdb.d/init.sql:ro
         networks:
-            - oracle2lakehouse-net
+            - ${NETWORK_NAME}
 
     minio:
         image: minio/minio:${MINIO_IMAGE_TAG}
@@ -55,66 +55,37 @@ services:
         volumes:
             - ${MINIO_DATA_VOLUME}:/data
         networks:
-            - oracle2lakehouse-net
+            - ${NETWORK_NAME}
 
-    iceberg-rest:
-        image: tabulario/iceberg-rest:1.6.0
-        container_name: ${COMPOSE_PROJECT_NAME}-iceberg-rest
-        hostname: iceberg-rest
+    clickhouse-server:
+        image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-23.8}
+        container_name: ${COMPOSE_PROJECT_NAME}-clickhouse
+        hostname: clickhouse
         ports:
-            - "${ICEBERG_REST_PORT}:8181"
+            - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+            - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
         environment:
-            # Core settings
-            - CATALOG__IMPL=org.apache.iceberg.rest.RESTCatalog
-            - CATALOG__IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
-            - CATALOG__WAREHOUSE=s3://raw
-            - CATALOG__FILE__IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
-            # AWS/S3 settings
-            - CATALOG__S3__IMPL=org.apache.iceberg.aws.s3.S3FileIO
-            - CATALOG__S3__ENDPOINT=minio:9000
-            - CATALOG__S3__ACCESS__KEY__ID=minioadmin
-            - CATALOG__S3__SECRET__ACCESS__KEY=minioadmin
-            - CATALOG__S3__PATH__STYLE__ACCESS=true
-            - CATALOG__S3__SSE__ENABLED=false
-            # AWS SDK settings
-            - AWS_ACCESS_KEY_ID=minioadmin
-            - AWS_SECRET_ACCESS_KEY=minioadmin
-            - AWS_REGION=us-east-1
-            - AWS_DEFAULT_REGION=us-east-1
-            - AWS_EC2_METADATA_DISABLED=true
-            # Additional S3 properties
-            - CATALOG__S3__PROPERTIES__AWS__ACCESS__KEY__ID=minioadmin
-            - CATALOG__S3__PROPERTIES__AWS__SECRET__ACCESS__KEY=minioadmin
-            - CATALOG__S3__PROPERTIES__AWS__REGION=us-east-1
-            - CATALOG__S3__PROPERTIES__FS__S3A__ACCESS__KEY=minioadmin
-            - CATALOG__S3__PROPERTIES__FS__S3A__SECRET__KEY=minioadmin
-            - CATALOG__S3__PROPERTIES__FS__S3A__ENDPOINT=minio:9000
-            - CATALOG__S3__PROPERTIES__FS__S3A__PATH__STYLE__ACCESS=true
-            # Debug logging
-            - JAVA_TOOL_OPTIONS=-Dorg.slf4j.simpleLogger.defaultLogLevel=debug -Daws.sdk.disableEc2Metadata=true
-            # Timestamp handling
-            - CATALOG__TIMESTAMP__PRECISION=microseconds
-            - CATALOG__DOWNCAST__NS__TIMESTAMP__TO__US__ON__WRITE=true
-            # Additional catalog settings
-            - CATALOG__STORE=org.apache.iceberg.aws.s3.S3FileIO
-            - CATALOG__CATALOG__IMPL=org.apache.iceberg.rest.RESTCatalog
-            - CATALOG__COMMIT_TABLE_CACHE_ENABLED=true
-            # Configure commit lock provider to use S3
-            - CATALOG__LOCK__IMPL=org.apache.iceberg.aws.s3.S3LockManager
-            - CATALOG__COMMIT_TABLE_CACHE_EXPIRATION_INTERVAL_MS=300000
+            CLICKHOUSE_DB: ${CLICKHOUSE_DB:-bank}
+            CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+            CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: ${CLICKHOUSE_ACCESS_MANAGEMENT:-1}
+            CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+        ulimits:
+            nofile:
+                soft: 262144
+                hard: 262144
+        volumes:
+            - ${CLICKHOUSE_DATA_VOLUME:-./volumes/clickhouse/data}:/var/lib/clickhouse
+            - ${CLICKHOUSE_LOG_VOLUME:-./volumes/clickhouse/logs}:/var/log/clickhouse-server
         healthcheck:
-            test: ["CMD", "wget", "--spider", "-q", "http://localhost:8181/v1/config"]
+            test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
             interval: 10s
             timeout: 5s
-            retries: 5
+            retries: 3
             start_period: 10s
-        depends_on:
-            - minio
         networks:
-            - oracle2lakehouse-net
-
+            - ${NETWORK_NAME}
 
 networks:
-    oracle2lakehouse-net:
+    oracle2clickhouse-net:
         driver: bridge
-        name: oracle2lakehouse-net
+        name: ${NETWORK_NAME}
