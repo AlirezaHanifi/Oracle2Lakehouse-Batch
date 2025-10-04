@@ -1,106 +1,95 @@
-import logging
+"""
+Oracle Client for data extraction using Airflow connections.
 
-import pandas as pd
-from airflow.providers.oracle.hooks.oracle import OracleHook
+This module enables:
+1. Connecting to Oracle databases via Airflow hooks
+2. Executing SQL queries with optional parameters
+3. Returning results as Polars DataFrames
+4. Handling large datasets efficiently with streaming fetch
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    import polars as pl
 
 
 class OracleClient:
+    """Client for interacting with Oracle databases."""
+
     def __init__(self, conn_id: str = "oracle_default"):
+        """
+        Initialize Oracle client using Airflow connection.
+
+        Args:
+            conn_id: Airflow connection ID for Oracle database
+        """
+        from airflow.providers.oracle.hooks.oracle import OracleHook
+
         logging.info("🟢 Connecting to Oracle with conn_id=%s", conn_id)
         self.hook = OracleHook(oracle_conn_id=conn_id)
-
-    def build_full_query(self, table: str, columns: list[str] | None = None) -> str:
-        select_cols = ", ".join(columns) if columns else "*"
-        query = f"SELECT {select_cols} FROM {table}"
-        logging.info("📝 Built full query for table=%s", table)
-        return query
-
-    def build_incremental_query(
-        self,
-        table: str,
-        incremental_key: str,
-        start_ts: str,
-        end_ts: str,
-        columns: list[str] | None = None,
-    ) -> str:
-        select_cols = ", ".join(columns) if columns else "*"
-        query = (
-            f"SELECT {select_cols} FROM {table} "
-            f"WHERE {incremental_key} >= TO_TIMESTAMP('{start_ts}', 'YYYY-MM-DD HH24:MI:SS') "
-            f"AND {incremental_key} < TO_TIMESTAMP('{end_ts}', 'YYYY-MM-DD HH24:MI:SS')"
-        )
-        logging.info(
-            "📝 Built incremental query for table=%s (key=%s, start=%s, end=%s)",
-            table,
-            incremental_key,
-            start_ts,
-            end_ts,
-        )
-        return query
-
-    def run_query(self, query: str, chunksize: int | None = None) -> pd.DataFrame:
-        logging.info("▶️ Running query (chunksize=%s)", chunksize)
-        try:
-            with self.hook.get_conn() as conn:
-                if chunksize:
-                    dfs = []
-                    for chunk in pd.read_sql(query, conn, chunksize=chunksize):
-                        logging.info("📄 Retrieved chunk with rows=%d", len(chunk))
-                        dfs.append(chunk)
-                    df = pd.concat(dfs, ignore_index=True)
-                else:
-                    df = pd.read_sql(query, conn)
-                df.columns = [col.lower() for col in df.columns]
-            logging.info("✅ Query finished successfully (%d rows)", len(df))
-            return df
-        except Exception as e:
-            logging.error("❌ Query failed: %s", e)
-            raise
-
-    def drop_columns(self, df: pd.DataFrame, drop_cols: list[str]) -> pd.DataFrame:
-        drop_cols = [col.lower() for col in drop_cols]
-        before_cols = set(df.columns)
-        df = df.drop(columns=drop_cols, errors="ignore")
-        after_cols = set(df.columns)
-        dropped = before_cols - after_cols
-        if dropped:
-            logging.info("🧹 Dropped columns: %s", list(dropped))
-        return df
 
     def fetch_table(
         self,
         table: str,
-        sync_mode: str = "full",
-        incremental_key: str | None = None,
-        start_ts: str | None = None,
-        end_ts: str | None = None,
-        drop_cols: list[str] | None = None,
-        chunksize: int | None = None,
-    ) -> pd.DataFrame:
-        logging.info("📥 Fetching table=%s in %s mode", table, sync_mode)
+        query: Optional[str] = None,
+        columns: Optional[List[str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> pl.DataFrame:
+        """
+        Fetch data from an Oracle table using optional custom query and parameters.
 
-        if sync_mode == "full":
-            query = self.build_full_query(table)
-        elif sync_mode == "incremental":
-            if not incremental_key or not start_ts or not end_ts:
-                raise ValueError(
-                    "Incremental mode requires incremental_key, start_ts, and end_ts"
-                )
-            query = self.build_incremental_query(
-                table, incremental_key, start_ts, end_ts
+        Args:
+            table: Table name (schema.table format)
+            query: Optional custom SQL query template. Use :param_name for parameters
+            columns: Optional list of columns to select
+            params: Optional parameters for the query
+
+        Returns:
+            Polars DataFrame containing the query results
+
+        Examples:
+            # Simple table fetch
+            df = client.fetch_table("schema.table")
+
+            # Custom query with parameters
+            df = client.fetch_table(
+                "schema.table",
+                query="SELECT * FROM :table WHERE created_at > :start_date",
+                params={"start_date": "2025-01-01"}
             )
-        else:
-            raise ValueError(f"Unsupported sync_mode: {sync_mode}")
+        """
+        import polars as pl
 
-        df = self.run_query(query, chunksize)
+        logging.info("📥 Fetching data from table=%s", table)
 
-        if drop_cols:
-            df = self.drop_columns(df, drop_cols)
+        if query is None:
+            cols = ", ".join(columns) if columns else "*"
+            query = f"SELECT {cols} FROM {table}"
 
-        logging.info(
-            "📦 Finished fetching table=%s (%d rows, %d columns)",
-            table,
-            len(df),
-            len(df.columns),
-        )
-        return df
+        try:
+            bind_params = params or {}
+            if ":table" in query:
+                bind_params["table"] = table
+
+            with self.hook.get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute(query, bind_params)
+                columns = [col[0].lower() for col in cursor.description]
+                data = cursor.fetchall()
+
+            df = pl.DataFrame(data, schema=columns, orient="row")
+
+            logging.info(
+                "✅ Query completed successfully (%d rows, %d columns)",
+                len(df),
+                len(df.columns),
+            )
+            return df
+
+        except Exception as e:
+            logging.error("❌ Query failed: %s", str(e))
+            raise
