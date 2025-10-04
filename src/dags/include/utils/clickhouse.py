@@ -98,17 +98,31 @@ class ClickHouseClient:
         self.execute(f"CREATE DATABASE IF NOT EXISTS {database}")
 
     def _table_exists(self, database: str, table: str) -> bool:
+        """Return True if the table exists in the ClickHouse database.
+
+        Uses system.tables count query and unwraps the scalar result.
+        """
         query = (
-            f"SELECT count() FROM system.tables WHERE database = '{database}' "
-            f"AND name = '{table}'"
+            "SELECT count() FROM system.tables "
+            f"WHERE database = '{database}' AND name = '{table}'"
         )
-        raw = self.execute(query)
-        cnt = self._unwrap_scalar(raw)
-        exists = bool(cnt)
-        logging.debug(
-            "🔎 Table exists check %s.%s -> %s (count=%s)", database, table, exists, cnt
-        )
-        return exists
+        try:
+            raw = self.execute(query)
+            cnt = self._unwrap_scalar(raw)
+            exists = bool(cnt)
+            logging.debug(
+                "🔎 Table exists check %s.%s -> %s (count=%s)",
+                database,
+                table,
+                exists,
+                cnt,
+            )
+            return exists
+        except Exception:
+            logging.exception(
+                "⚠️ Failed to check table existence for %s.%s", database, table
+            )
+            return False
 
     def _get_table_count(self, database: str, table: str) -> int:
         try:
